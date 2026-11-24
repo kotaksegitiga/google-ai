@@ -20,6 +20,12 @@ from pathlib import Path
 
 from device_selector import auto_select_device, online_serials
 
+try:
+    from mumu_remote import start_android
+    MUMU_REMOTE_AVAILABLE = True
+except Exception:  # pragma: no cover - optional on machines without MuMu
+    MUMU_REMOTE_AVAILABLE = False
+
 BASE = Path(__file__).resolve().parent
 ADB_CANDIDATES = [
     os.environ.get("ADB_PATH", ""),
@@ -172,9 +178,21 @@ def find_adb() -> str:
 
 
 def connect_emulator(adb):
-    """Select an existing Android device; do not connect all emulator ports."""
+    """Select an existing Android device; do not connect all emulator ports.
+
+    When no device is online and MuMu is installed, start MuMu and launch an
+    Android instance automatically so the user does not have to open MuMu
+    manually. ADB port probing keeps the original behaviour as a fallback.
+    """
     step("Connecting to the emulator")
     devices = online_serials(adb)
+    if not devices and MUMU_REMOTE_AVAILABLE:
+        try:
+            serial = start_android(adb_path=adb)
+            ok(f"Connected device: {serial}")
+            return serial
+        except Exception as exc:  # pragma: no cover - depends on host MuMu state
+            warn(f"Could not start MuMu automatically: {exc}")
     if not devices:
         for port in ("16384", "7555", "16416", "21503", "62001"):
             subprocess.run([adb, "connect", f"127.0.0.1:{port}"],

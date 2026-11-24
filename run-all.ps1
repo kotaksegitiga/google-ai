@@ -41,6 +41,10 @@ param(
     [ValidateRange(2,5)]
     [int]$StartStep = 2,
     [switch]$Force,
+    [switch]$NoStartMumu,
+    [ValidateRange(0, 100)]
+    [int]$MumuInstance = 0,
+    [switch]$CreateMumuInstance,
     [ValidateSet("auto", "choose", "thread")]
     [string]$ActivityMethod = "auto",
     [switch]$SetupOnly,
@@ -124,6 +128,24 @@ function Get-RuntimeValue([string[]]$LookupArgs) {
     }
     $encoded = ([string]$resultLine).Substring("RUNTIME_RESULT:".Length)
     return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+}
+
+function Start-MemuAuto([string]$MumuDir, [int]$VmIndex = 0, [switch]$CreateMissing) {
+    # Start MuMu and launch an existing Android instance automatically so the
+    # user does not have to open MuMu manually. A new instance is only created
+    # with -CreateMissing. Throws on failure so the caller can fall back to the
+    # existing manual guidance.
+    $manager = Join-Path $MumuDir "nx_main\MuMuManager.exe"
+    if (-not (Test-Path -LiteralPath $manager)) { throw "MuMuManager.exe not found under $MumuDir" }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { throw "Python is required to start MuMu automatically." }
+    $script = Join-Path $PSScriptRoot "mumu_remote.py"
+    $args = @($script, "--mumu-dir", $MumuDir, "--adb-path", (Join-Path $MumuDir "nx_main\adb.exe"))
+    if ($VmIndex -gt 0) { $args += @("--vmindex", [string]$VmIndex) }
+    if ($CreateMissing) { $args += "--create-missing" }
+    $output = & $python @args 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ("MuMu auto-start failed: {0}" -f ($output -join [Environment]::NewLine)) }
+    Note ("MuMu started automatically; ADB path set to {0}\nx_main\adb.exe" -f $MumuDir)
 }
 
 function Get-AccountReportKey([string]$Email) {
@@ -235,6 +257,38 @@ try {
         }
     )
     if ($online.Count -eq 0) {
+        Show-Status "Connection" "Trying local emulator ADB ports..."
+        $null = Get-RuntimeValue -LookupArgs @("connect-device")
+        $deviceLines = @(& $Adb devices)
+        if ($LASTEXITCODE -ne 0) { Stop-Workflow "ADB device discovery failed after reconnect." }
+        $online = @(
+            foreach ($line in $deviceLines) {
+                if ($line -match '^\s*(\S+)\s+device\s*$') { $Matches[1] }
+            }
+        )
+    }
+    if ($online.Count -eq 0 -and -not $NoStartMumu) {
+        # Start MuMu automatically so the user does not have to open it manually.
+        # A new Android instance is only created when -CreateMumuInstance is set.
+        Show-Status "Connection" "No device online; starting MuMu automatically..."
+        $mumuDir = if ($env:MUMU_DIR) { $env:MUMU_DIR } else { "C:\Program Files\Netease\MuMuPlayer" }
+        try {
+            Start-MemuAuto $mumuDir -VmIndex $MumuInstance -CreateMissing:$CreateMumuInstance
+            $Adb = Join-Path $mumuDir "nx_main\adb.exe"
+            $env:ADB_PATH = $Adb
+            $deviceLines = @(& $Adb devices)
+            if ($LASTEXITCODE -eq 0) {
+                $online = @(
+                    foreach ($line in $deviceLines) {
+                        if ($line -match '^\s*(\S+)\s+device\s*$') { $Matches[1] }
+                    }
+                )
+            }
+        } catch {
+            Note ("MuMu auto-start unavailable: {0}" -f $_.Exception.Message)
+        }
+    }
+    if ($online.Count -eq 0) {
         Note ($deviceLines -join [Environment]::NewLine)
         Stop-Workflow "No online ADB devices. Start MuMu, enable ADB debugging and wait for status 'device'."
     }
@@ -272,7 +326,10 @@ try {
     $AndroidVersion = ((& $Adb -s $Serial shell getprop ro.build.version.release) | Out-String).Trim()
     $AndroidSdk = ((& $Adb -s $Serial shell getprop ro.build.version.sdk) | Out-String).Trim()
     $AndroidAbi = ((& $Adb -s $Serial shell getprop ro.product.cpu.abi) | Out-String).Trim()
-    Note ("Android {0} (SDK {1}), ABI {2}, activity lookup {3}" -f $AndroidVersion, $AndroidSdk, $AndroidAbi, $ActivityMethod)
+    if ($AndroidVersion -and $AndroidSdk -and $AndroidAbi) {
+        Show-Status "Android" ("{0} (SDK {1}), ABI {2}" -f $AndroidVersion, $AndroidSdk, $AndroidAbi)
+    }
+    Note ("Activity lookup: {0}" -f $ActivityMethod)
 
     Stage "Preflight: Verify required Android apps"
     foreach ($package in @("com.android.vending", "com.google.android.apps.subscriptions.red")) {
@@ -286,6 +343,7 @@ try {
     Stage "Original Step 0: Environment check"
     Note "The original ultra0.py may repair Frida and change emulator proxy/network settings."
     Run-Command $Python @("ultra0.py", "--check", "--serial", $Serial)
+    Write-Host "EPLUS_STAGE_DONE:0"
 
     if ($SetupOnly -or ($Step -eq 0 -and -not $AllStages)) {
         Note "Original Step 0 complete. No checkout or purchase requested."
@@ -390,9 +448,13 @@ try {
         } else {
             Note "The -Force switch was explicitly supplied; no additional console confirmation in single-step mode."
         }
-    } elseif (-not $playAccount -or $playAccount -cne $Email) {
-        $accountMismatch = ("Play account mismatch or unverified. Detected '{0}', expected '{1}'. " +
-                            "Check the Play Store profile before proceeding.")
+    } elseif (-not $playAccount) {
+        # An unreadable account is not proof that the wrong account is active.
+        # Never guess or bypass this identity check on a paid stage.
+        Stop-Workflow "Cannot identify the active Google Play account. Open the Play Store profile, select the intended account, then repeat Step 1."
+    } elseif ($playAccount -cne $Email) {
+        $accountMismatch = ("Play account mismatch. Detected '{0}', expected '{1}'. " +
+                            "Select the correct Play Store account and repeat Step 1.")
         Stop-Workflow ($accountMismatch -f $playAccount, $Email)
     }
 
